@@ -483,9 +483,220 @@ class TestDrill(ReplicaTestBase):
 
 
 # ----------------------------------------------------------------------
-# 5) 落后超限
+# 5) 演练任期到期的恢复（主动收口 / 恰好一次终态 / 恢复不跳过隔离批次）
 # ----------------------------------------------------------------------
 
+def drill_finish_audits(rep: Replicator, drill_id: str) -> list[dict]:
+    return [a for a in rep.store.list_audit(500, kind="drill_finished")
+            if a["detail"].get("drill_id") == drill_id]
+
+
+class TestDrillExpiryRecovery(ReplicaTestBase):
+    def test_50_expiry_without_caller_closes_and_resumes(self):
+        # 调用方不再发请求：sweeper 主动收口、恰好一条终态审计、
+        # 旧凭证稳定 410、后台同步从停下的位置继续
+        seed_business(self.base)
+        rep = self.make_replicator()
+        self.addCleanup(self.stop, rep)
+        wait_until(lambda: rep.confirmed_index >= 1)
+        drill = rep.create_drill("DR-AUTO", term_seconds=1)
+        token, locked = drill["term_token"], drill["locked_index"]
+        bump_capacity_n(self.base, SEGMENT_SIZE, "auto")  # 主站在冻结期继续推进
+
+        wait_until(lambda: rep.get_drill("DR-AUTO")["state"] == "EXPIRED", timeout=5)
+        audits = drill_finish_audits(rep, "DR-AUTO")
+        self.assertEqual(len(audits), 1, "到期收口必须恰好一条终态审计")
+        self.assertEqual(audits[0]["detail"]["state"], "EXPIRED")
+        self.assertEqual(audits[0]["detail"]["reason"], "TERM_EXPIRED")
+
+        # 同步从停下的位置继续（不是跳到主站最新）
+        wait_until(lambda: rep.confirmed_index == locked + 1)
+        # 旧凭证稳定 410，且反复读取不会再产生终态审计
+        for _ in range(3):
+            with self.assertRaises(Exception) as cm:
+                rep.serve_term(token)
+            self.assertEqual(cm.exception.status, 410)
+            self.assertEqual(cm.exception.reason, TERM_EXPIRED)
+        self.assertEqual(len(drill_finish_audits(rep, "DR-AUTO")), 1)
+
+    def test_51_sweeper_survives_transient_error(self):
+        # sweeper 循环遭遇一次瞬时异常不得死亡：否则演练永不收口、同步永久冻结
+        seed_business(self.base)
+        rep = self.make_replicator()
+        self.addCleanup(self.stop, rep)
+        wait_until(lambda: rep.confirmed_index >= 1)
+
+        orig = rep.store.active_drill
+        blown = {"n": 0}
+
+        def flaky():
+            if threading.current_thread().name == "drill-sweeper" and blown["n"] < 1:
+                blown["n"] += 1
+                raise RuntimeError("transient sqlite hiccup")
+            return orig()
+
+        rep.store.active_drill = flaky  # type: ignore[assignment]
+        time.sleep(1.0)  # sweeper 必然撞上这次异常
+        rep.store.active_drill = orig  # type: ignore[assignment]
+        self.assertTrue(rep.sweeper.is_alive(), "sweeper 线程不得因瞬时错误死亡")
+
+        drill = rep.create_drill("DR-FLAKY", term_seconds=1)
+        locked = drill["locked_index"]
+        bump_capacity_n(self.base, SEGMENT_SIZE, "flaky")
+        wait_until(lambda: rep.get_drill("DR-FLAKY")["state"] == "EXPIRED", timeout=5)
+        self.assertEqual(len(drill_finish_audits(rep, "DR-FLAKY")), 1)
+        wait_until(lambda: rep.confirmed_index > locked)
+
+    def test_52_cancel_races_expiry_single_terminal(self):
+        # 定时到期 / 人工撤销 / 并发读取相撞：恰好一次终态 + 一条审计
+        seed_business(self.base)
+        rep = self.make_replicator()
+        self.addCleanup(self.stop, rep)
+        wait_until(lambda: rep.confirmed_index >= 1)
+        for i in range(4):
+            did = f"DR-RACE-{i}"
+            drill = rep.create_drill(did, term_seconds=0.6)
+            token = drill["term_token"]
+
+            def cancel():
+                time.sleep(0.55 + 0.05 * (i % 3))  # 在到期时刻附近撞上来
+                try:
+                    rep.cancel_drill(did)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            def read():
+                for _ in range(30):
+                    time.sleep(0.04)
+                    try:
+                        rep.serve_term(token)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            tc = Thread(target=cancel, daemon=True)
+            tr = Thread(target=read, daemon=True)
+            tc.start(); tr.start(); tc.join(); tr.join()
+            wait_until(lambda: rep.get_drill(did)["state"]
+                       in ("CANCELLED", "EXPIRED"), timeout=5)
+            time.sleep(1.2)  # 让 sweeper 再多扫几轮，确保不会补刀
+            final = rep.get_drill(did)
+            audits = drill_finish_audits(rep, did)
+            self.assertEqual(len(audits), 1, f"{did} 只能落一次终态审计")
+            self.assertEqual(audits[0]["detail"]["state"], final["state"],
+                             "审计里的终态必须与权威行一致")
+            # 再取消是幂等重放，不产生新审计
+            again = rep.cancel_drill(did)
+            self.assertTrue(again.get("idempotent_replay"))
+            self.assertEqual(len(drill_finish_audits(rep, did)), 1)
+            with self.assertRaises(Exception) as cm:
+                rep.serve_term(token)
+            self.assertEqual(cm.exception.status, 410)
+
+    def test_53_restart_with_expired_drill_closes_once(self):
+        # 到期发生在停机窗口：重启后 sweeper 收口，恰好一次终态/审计
+        seed_business(self.base)
+        rep = self.make_replicator()
+        wait_until(lambda: rep.confirmed_index >= 1)
+        drill = rep.create_drill("DR-DOWN", term_seconds=1)
+        token, locked = drill["term_token"], drill["locked_index"]
+        self.stop(rep)  # 任期未到时进程停掉
+        time.sleep(1.2)  # 截止时刻在“停机窗口”内过去
+
+        store2 = ReplicaStore(self.replica_db, segment_size=SEGMENT_SIZE)
+        rep2 = Replicator(store2, primary_url=self.base, poll_interval=0.03)
+        rep2.start()
+        self.addCleanup(self.stop, rep2)
+        wait_until(lambda: rep2.get_drill("DR-DOWN")["state"] == "EXPIRED", timeout=5)
+        time.sleep(1.0)
+        audits = drill_finish_audits(rep2, "DR-DOWN")
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0]["detail"]["state"], "EXPIRED")
+        with self.assertRaises(Exception) as cm:
+            rep2.serve_term(token)
+        self.assertEqual(cm.exception.status, 410)
+        bump_capacity_n(self.base, SEGMENT_SIZE, "down")
+        wait_until(lambda: rep2.confirmed_index > locked)
+
+    def test_54_two_processes_single_terminal(self):
+        # 服务重启后旧进程未死（纪元围栏场景）：两个进程的 sweeper 同时清扫
+        # 同一到期演练，CAS 保证只落一次终态、一条审计
+        seed_business(self.base)
+        rep1 = self.make_replicator()
+        self.addCleanup(self.stop, rep1)
+        wait_until(lambda: rep1.confirmed_index >= 1)
+        # 先追平主站全部密封分段：之后没有新写入，两个轮询者都无事可做，
+        # 聚焦演练终态的跨进程相撞（同一库双活轮询本身不是受支持场景）
+        sealed = rep1._fetch_primary_status()["sealed_index"]  # noqa: SLF001
+        wait_until(lambda: rep1.confirmed_index >= sealed)
+        rep1.create_drill("DR-Z", term_seconds=0.6)
+
+        store2 = ReplicaStore(self.replica_db, segment_size=SEGMENT_SIZE)
+        rep2 = Replicator(store2, primary_url=self.base, poll_interval=0.03)
+        rep2.start()
+        self.addCleanup(self.stop, rep2)
+
+        wait_until(lambda: rep2.get_drill("DR-Z")["state"] == "EXPIRED", timeout=6)
+        time.sleep(2.0)  # 两个 sweeper 都扫过若干轮
+        audits = drill_finish_audits(rep2, "DR-Z")
+        self.assertEqual(len(audits), 1, "跨进程相撞也只能落一次终态审计")
+
+        # 跨进程 撤销×到期 相撞：终态与审计同样恰好一次且一致
+        rep2.create_drill("DR-Z2", term_seconds=0.8)
+        time.sleep(0.75)
+        rep2.cancel_drill("DR-Z2")
+        time.sleep(1.5)
+        final = rep2.get_drill("DR-Z2")
+        audits2 = drill_finish_audits(rep2, "DR-Z2")
+        self.assertEqual(len(audits2), 1)
+        self.assertEqual(audits2[0]["detail"]["state"], final["state"])
+
+    def test_55_recovery_does_not_skip_quarantined_batch(self):
+        # 缺口隔离未处置时进入演练；到期恢复后必须从停下的位置继续，
+        # 处置仍待处置的异常批次，而不是跳过它
+        seed_business(self.base, rounds=SEGMENT_SIZE * 2)
+        rep = self.make_replicator()
+        self.addCleanup(self.stop, rep)
+        wait_until(lambda: rep.confirmed_index >= 1)
+        rep.set_paused(True)
+        wait_until(lambda: rep.status()["replication"]["primary_sealed_index"] >= 2)
+        self.set_chaos("gap", 2)
+        rep.set_paused(False)
+        wait_until(lambda: any(
+            q["reason"] == verifier.SEGMENT_INDEX_MISMATCH
+            for q in rep.store.list_quarantined()))
+        self.assertEqual(rep.confirmed_index, 1)
+
+        drill = rep.create_drill("DR-GAP", term_seconds=1)
+        self.assertEqual(drill["state"], "ISSUED")
+        wait_until(lambda: rep.get_drill("DR-GAP")["state"] == "EXPIRED", timeout=5)
+        # 缺口未恢复：边界不得越过仍待处置的第 2 段
+        time.sleep(0.5)
+        self.assertEqual(rep.confirmed_index, 1, "恢复不得跳过未处置的隔离批次")
+        # 缺口恢复：确认第 2 段、旧隔离标记消除、边界连续无跳段
+        self.set_chaos(None)
+        wait_until(lambda: rep.confirmed_index >= 2)
+        digests = rep.store.segment_digests()
+        self.assertEqual(set(digests), set(range(1, rep.confirmed_index + 1)))
+        resolved = [q for q in rep.store.list_quarantined(True)
+                    if q["segment_index"] == 2 and q["resolved_at"]]
+        self.assertTrue(resolved)
+
+    def test_56_shutdown_joins_threads(self):
+        # 关停必须等拉取/清扫线程退出，否则关闭存储时仍有在途 SQL（段错误）
+        seed_business(self.base)
+        rep = self.make_replicator()
+        wait_until(lambda: rep.confirmed_index >= 1)
+        rep.create_drill("DR-JOIN", term_seconds=0.4)
+        time.sleep(0.45)  # sweeper 活跃收口窗口
+        rep.shutdown()
+        self.assertFalse(rep.thread.is_alive())
+        self.assertFalse(rep.sweeper.is_alive())
+        rep.store.close()  # 不应再段错误
+
+
+# ----------------------------------------------------------------------
+# 6) 落后超限
+# ----------------------------------------------------------------------
 class TestLag(ReplicaTestBase):
     def test_40_lag_over_limit(self):
         seed_business(self.base)

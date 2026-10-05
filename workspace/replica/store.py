@@ -88,6 +88,10 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 GENESIS_HASH = "0" * 64
 
+# 演练状态机：活动状态（可迁往终态）与终态
+DRILL_ACTIVE_STATES = ("VALIDATING", "ISSUED")
+DRILL_TERMINAL_STATES = ("CANCELLED", "ABORTED", "EXPIRED")
+
 
 def new_token() -> str:
     return "drill-" + uuid.uuid4().hex
@@ -122,7 +126,8 @@ class ReplicaStore:
     # ------------------------------------------------------------------
 
     def meta(self) -> dict[str, Any]:
-        r = self.conn.execute("SELECT * FROM meta WHERE id = 1").fetchone()
+        with self.lock:
+            r = self.conn.execute("SELECT * FROM meta WHERE id = 1").fetchone()
         return dict(r)
 
     def get_epoch(self) -> int:
@@ -179,21 +184,24 @@ class ReplicaStore:
             )
 
     def load_segments(self) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
-            "SELECT envelope_json FROM segments ORDER BY segment_index"
-        ).fetchall()
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT envelope_json FROM segments ORDER BY segment_index"
+            ).fetchall()
         return [json.loads(r["envelope_json"]) for r in rows]
 
     def get_segment(self, index: int) -> dict[str, Any] | None:
-        r = self.conn.execute(
-            "SELECT envelope_json FROM segments WHERE segment_index = ?", (index,)
-        ).fetchone()
+        with self.lock:
+            r = self.conn.execute(
+                "SELECT envelope_json FROM segments WHERE segment_index = ?", (index,)
+            ).fetchone()
         return json.loads(r["envelope_json"]) if r else None
 
     def segment_digests(self) -> dict[int, str]:
-        rows = self.conn.execute(
-            "SELECT segment_index, digest FROM segments ORDER BY segment_index"
-        ).fetchall()
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT segment_index, digest FROM segments ORDER BY segment_index"
+            ).fetchall()
         return {int(r["segment_index"]): r["digest"] for r in rows}
 
     # ------------------------------------------------------------------
@@ -231,7 +239,9 @@ class ReplicaStore:
         if not include_resolved:
             sql += " WHERE resolved_at IS NULL"
         sql += " ORDER BY id DESC LIMIT 200"
-        return [dict(r) for r in self.conn.execute(sql).fetchall()]
+        with self.lock:
+            rows = self.conn.execute(sql).fetchall()
+        return [dict(r) for r in rows]
 
     def resolve_open_for_index(self, segment_index: int, resolution: str) -> None:
         """该序号分段已被健康分段确认：此前对它的隔离记录标记为已消除。"""
@@ -243,9 +253,10 @@ class ReplicaStore:
             )
 
     def has_open_gap(self) -> bool:
-        r = self.conn.execute(
-            "SELECT 1 FROM quarantined WHERE resolved_at IS NULL LIMIT 1"
-        ).fetchone()
+        with self.lock:
+            r = self.conn.execute(
+                "SELECT 1 FROM quarantined WHERE resolved_at IS NULL LIMIT 1"
+            ).fetchone()
         return r is not None
 
     # ------------------------------------------------------------------
@@ -282,51 +293,82 @@ class ReplicaStore:
                 ),
             )
 
-    def get_drill(self, drill_id: str) -> dict[str, Any] | None:
-        r = self.conn.execute(
-            "SELECT * FROM drills WHERE drill_id = ?", (drill_id,)
-        ).fetchone()
+    @staticmethod
+    def _row_to_drill(r: sqlite3.Row | None) -> dict[str, Any] | None:
         if r is None:
             return None
         d = dict(r)
         d["report"] = json.loads(d["report_json"]) if d["report_json"] else {}
         del d["report_json"]
         return d
+
+    def get_drill(self, drill_id: str) -> dict[str, Any] | None:
+        with self.lock:
+            r = self.conn.execute(
+                "SELECT * FROM drills WHERE drill_id = ?", (drill_id,)
+            ).fetchone()
+        return self._row_to_drill(r)
 
     def list_drills(self, limit: int = 50) -> list[dict[str, Any]]:
-        rows = self.conn.execute(
-            "SELECT * FROM drills ORDER BY created_at DESC LIMIT ?", (limit,)
-        ).fetchall()
-        out = []
-        for r in rows:
-            d = dict(r)
-            d["report"] = json.loads(d["report_json"]) if d["report_json"] else {}
-            del d["report_json"]
-            out.append(d)
-        return out
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT * FROM drills ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [d for d in (self._row_to_drill(r) for r in rows) if d is not None]
 
     def active_drill(self) -> dict[str, Any] | None:
-        r = self.conn.execute(
-            "SELECT * FROM drills WHERE state IN ('VALIDATING','ISSUED')"
-            " ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
-        if r is None:
-            return None
-        d = dict(r)
-        d["report"] = json.loads(d["report_json"]) if d["report_json"] else {}
-        del d["report_json"]
-        return d
+        with self.lock:
+            r = self.conn.execute(
+                "SELECT * FROM drills WHERE state IN ('VALIDATING','ISSUED')"
+                " ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+        return self._row_to_drill(r)
 
     def drill_by_token(self, token: str) -> dict[str, Any] | None:
-        r = self.conn.execute(
-            "SELECT * FROM drills WHERE term_token = ?", (token,)
-        ).fetchone()
-        if r is None:
-            return None
-        d = dict(r)
-        d["report"] = json.loads(d["report_json"]) if d["report_json"] else {}
-        del d["report_json"]
-        return d
+        with self.lock:
+            r = self.conn.execute(
+                "SELECT * FROM drills WHERE term_token = ?", (token,)
+            ).fetchone()
+        return self._row_to_drill(r)
+
+    def finish_drill(
+        self,
+        drill_id: str,
+        *,
+        state: str,
+        reason: str,
+        detail: str,
+        report: dict[str, Any],
+        finished_at: float,
+    ) -> bool:
+        """把演练原子地落入终态（CAS）并同事务写下唯一一条终态审计。
+
+        仅当当前仍处于活动状态（VALIDATING/ISSUED）时迁移成功、返回 True；
+        并发/跨进程（取消、到期清扫、重启作废、迟到读取）的另一个终态迁移
+        会落败并返回 False —— 无论多少路径相撞，只落下一次终态、一条审计。
+        """
+        with self.lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE drills SET state=?, term_token=NULL, term_expires_at=NULL,"
+                " report_json=?, updated_at=?, finished_at=?, fail_reason=?"
+                f" WHERE drill_id=? AND state IN ({','.join('?' * len(DRILL_ACTIVE_STATES))})",
+                (state, canonical(report), finished_at, finished_at, reason,
+                 drill_id, *DRILL_ACTIVE_STATES),
+            )
+            if cur.rowcount == 0:
+                return False
+            self.conn.execute(
+                "INSERT INTO audit_log (at, kind, detail_json) VALUES (?,?,?)",
+                (
+                    finished_at,
+                    "drill_finished",
+                    canonical({
+                        "drill_id": drill_id, "state": state,
+                        "reason": reason, "detail": detail,
+                    }),
+                ),
+            )
+        return True
 
     # ------------------------------------------------------------------
     # audit
@@ -341,17 +383,15 @@ class ReplicaStore:
 
     def list_audit(self, limit: int = 100, kind: str | None = None) -> list[dict[str, Any]]:
         if kind:
-            rows = self.conn.execute(
-                "SELECT id, at, kind, detail_json FROM audit_log"
-                " WHERE kind = ? ORDER BY id DESC LIMIT ?",
-                (kind, limit),
-            ).fetchall()
+            sql = ("SELECT id, at, kind, detail_json FROM audit_log"
+                   " WHERE kind = ? ORDER BY id DESC LIMIT ?")
+            args: tuple = (kind, limit)
         else:
-            rows = self.conn.execute(
-                "SELECT id, at, kind, detail_json FROM audit_log"
-                " ORDER BY id DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            sql = ("SELECT id, at, kind, detail_json FROM audit_log"
+                   " ORDER BY id DESC LIMIT ?")
+            args = (limit,)
+        with self.lock:
+            rows = self.conn.execute(sql, args).fetchall()
         return [
             {"id": r["id"], "at": r["at"], "kind": r["kind"],
              "detail": json.loads(r["detail_json"])}
@@ -359,4 +399,5 @@ class ReplicaStore:
         ]
 
     def close(self) -> None:
-        self.conn.close()
+        with self.lock:
+            self.conn.close()

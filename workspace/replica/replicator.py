@@ -18,6 +18,12 @@
 全量验证（事件链、分段链、守恒、重放等价、命令结果、任期内无新分段）→
 成功发 ISSUED 任期地址；同一演练再请求返回原结果；取消/到期 →
 地址失效，复制自动恢复。
+
+终态恰好一次：任期到点由 sweeper 主动收口（不等调用方再发请求），
+终态迁移是存储层的 CAS 且与审计写入同一事务 —— 定时到期、人工撤销、
+进程重启（含旧纪元僵尸进程）、并发读取无论怎么相撞，只落一次终态、
+一条 ``drill_finished`` 审计；旧任期地址稳定返回 410。恢复复制从最后
+确认边界继续，仍待处置的隔离分段不会被跳过。
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ import uuid
 from typing import Any
 
 from . import verifier
-from .store import ReplicaStore, new_token
+from .store import DRILL_TERMINAL_STATES, ReplicaStore, new_token
 
 # 演练 / 复制异常原因码
 PRIMARY_UNAVAILABLE = "PRIMARY_UNAVAILABLE"
@@ -118,6 +124,12 @@ class Replicator:
 
     def shutdown(self) -> None:
         self._stop.set()
+        # 等拉取/清扫线程退出：避免关闭存储时仍有在途 SQL（连接被并发关闭
+        # 会直接段错误）。线程最多阻塞在一次在途 HTTP 拉取上。
+        current = threading.current_thread()
+        for t in (self.thread, self.sweeper):
+            if t is not current and t.is_alive():
+                t.join(timeout=self.request_timeout + 1.0)
 
     def _abort_orphan_validating(self) -> None:
         drill = self.store.active_drill()
@@ -146,14 +158,23 @@ class Replicator:
 
     def _sweep_loop(self) -> None:
         while not self._stop.wait(0.5):
-            with self._lock:
-                drill = self.store.active_drill()
-                if drill and drill["state"] == "ISSUED":
-                    if drill["term_expires_at"] and time.time() >= drill["term_expires_at"]:
-                        self._finish_drill(
-                            drill, "EXPIRED", TERM_EXPIRED,
-                            f"任期已于 {drill['term_expires_at']} 到期",
-                        )
+            try:
+                self._sweep_expired_drills()
+            except Exception as exc:  # 清扫线程不能死：一次瞬时错误不该让
+                with self._lock:      # 之后的演练永不收口、复制永久冻结
+                    self.last_error = f"{type(exc).__name__}: {exc}"
+
+    def _sweep_expired_drills(self) -> None:
+        """主动收口已到期的任期：不等调用方再发请求，到点即落终态。"""
+        with self._lock:
+            drill = self.store.active_drill()
+            if not drill or drill["state"] != "ISSUED":
+                return
+            if drill["term_expires_at"] and time.time() >= drill["term_expires_at"]:
+                self._finish_drill(
+                    drill, "EXPIRED", TERM_EXPIRED,
+                    f"任期已于 {drill['term_expires_at']} 到期",
+                )
 
     def poll_once(self) -> dict[str, Any] | None:
         """一轮拉取：看主站状态 → 滞后判定 → 拉下一分段。返回应用结果。"""
@@ -684,16 +705,30 @@ class Replicator:
             drill = self.store.get_drill(drill_id)
             if drill is None:
                 raise ReplicatorError("NOT_FOUND", f"演练不存在: {drill_id}", status=404)
-            if drill["state"] in ("CANCELLED", "ABORTED", "EXPIRED"):
+            if drill["state"] in DRILL_TERMINAL_STATES:
                 drill["idempotent_replay"] = True
                 return drill
-            self._finish_drill(drill, "CANCELLED", "CANCELLED", "操作员取消演练")
+            if not self._finish_drill(drill, "CANCELLED", "CANCELLED", "操作员取消演练"):
+                # 与定时到期/重启作废相撞且落败：返回已落定的权威终态
+                drill = self.store.get_drill(drill_id)
+                drill["idempotent_replay"] = True
             return drill
 
     def _finish_drill(
         self, drill: dict[str, Any], state: str, reason: str, detail: str
-    ) -> None:
+    ) -> bool:
+        """落终态（恰好一次）：终态迁移与审计写入是同一事务里的 CAS，
+        定时到期/人工撤销/重启作废/并发读取无论怎么相撞，只有一路能赢得
+        迁移并写下唯一的 drill_finished 审计；落败方返回 False。"""
         now = time.time()
+        report = drill.get("report") or {}
+        report.setdefault("termination", {"reason": reason, "detail": detail, "at": now})
+        landed = self.store.finish_drill(
+            drill["drill_id"], state=state, reason=reason, detail=detail,
+            report=report, finished_at=now,
+        )
+        if not landed:
+            return False
         drill.update({
             "state": state,
             "term_token": None,
@@ -701,14 +736,9 @@ class Replicator:
             "updated_at": now,
             "finished_at": now,
             "fail_reason": reason,
+            "report": report,
         })
-        report = drill.get("report") or {}
-        report.setdefault("termination", {"reason": reason, "detail": detail, "at": now})
-        drill["report"] = report
-        self.store.upsert_drill(drill)
-        self.store.audit("drill_finished", {
-            "drill_id": drill["drill_id"], "state": state, "reason": reason, "detail": detail,
-        })
+        return True
 
     def get_drill(self, drill_id: str) -> dict[str, Any]:
         d = self.store.get_drill(drill_id)
