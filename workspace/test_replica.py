@@ -505,5 +505,253 @@ class TestLag(ReplicaTestBase):
         self.assertEqual(rep.confirmed_index, boundary)
 
 
+# ----------------------------------------------------------------------
+# 6) 任期到期恢复：主动收口 / 410 / 同步续传 / 单次终态 / 不跳异常批次
+# ----------------------------------------------------------------------
+
+class TestTermRecovery(ReplicaTestBase):
+    def _finished_audits(self, store, drill_id):
+        return [
+            a for a in store.list_audit(500)
+            if a["kind"] == "drill_finished" and a["detail"]["drill_id"] == drill_id
+        ]
+
+    def test_50_sweeper_closes_without_any_request_and_sync_resumes(self):
+        """无人再请求旧凭证：截止时刻到达后 sweeper 仍主动收口，
+        冻结解除，同步从停下的位置继续（不跳过任何分段）。"""
+        seed_business(self.base)
+        rep = self.make_replicator()
+        self.addCleanup(self.stop, rep)
+        wait_until(lambda: rep.confirmed_index >= 1)
+        locked = rep.confirmed_index
+        drill = rep.create_drill("DR-AUTO", term_seconds=1)
+        token = drill["term_token"]
+        # 冻结期间主站密封新分段
+        bump_capacity_n(self.base, SEGMENT_SIZE, "after-lock")
+        # 全程不调用 serve_term：记录必须自行收口
+        wait_until(lambda: rep.get_drill("DR-AUTO")["state"] == "EXPIRED", timeout=4)
+        d = rep.get_drill("DR-AUTO")
+        self.assertIsNone(d["term_token"])
+        self.assertIsNotNone(d["finished_at"])
+        # 旧凭证稳定 410
+        with self.assertRaises(Exception) as cm:
+            rep.serve_term(token)
+        self.assertEqual(cm.exception.status, 410)
+        self.assertEqual(cm.exception.reason, TERM_EXPIRED)
+        # 后台同步从冻结点续上，且恰好只确认被冻结的那一段（不跳号）
+        wait_until(lambda: rep.confirmed_index >= locked + 1, timeout=6)
+        self.assertEqual(rep.confirmed_index, locked + 1)
+        digests = rep.store.segment_digests()
+        self.assertEqual(set(digests), set(range(1, rep.confirmed_index + 1)))
+        # 只有一次终态、一条收口审计
+        self.assertEqual(len(self._finished_audits(rep.store, "DR-AUTO")), 1)
+
+    def test_51_expiry_collides_with_cancel_and_concurrent_reads(self):
+        """定时结束与人工撤销、并发读取同时相撞：只落一次终态、一条审计。"""
+        seed_business(self.base)
+        rep = self.make_replicator()
+        self.addCleanup(self.stop, rep)
+        wait_until(lambda: rep.confirmed_index >= 1)
+        drill = rep.create_drill("DR-RACE", term_seconds=0.6)
+        token = drill["term_token"]
+
+        barrier = threading.Barrier(9)
+
+        def reader():
+            barrier.wait()
+            for _ in range(40):
+                try:
+                    rep.serve_term(token)
+                except Exception:
+                    pass
+                time.sleep(0.004)
+
+        threads = [Thread(target=reader) for _ in range(8)]
+        for t in threads:
+            t.start()
+        barrier.wait()
+        time.sleep(0.62)  # 与 sweeper 的到期收口竞争
+        try:
+            rep.cancel_drill("DR-RACE")
+        except Exception:
+            pass
+        for t in threads:
+            t.join()
+        time.sleep(0.3)
+
+        d = rep.get_drill("DR-RACE")
+        self.assertIn(d["state"], ("EXPIRED", "CANCELLED"))
+        finals = self._finished_audits(rep.store, "DR-RACE")
+        self.assertEqual(len(finals), 1, f"收口审计必须恰好一条: {finals}")
+        self.assertEqual({finals[0]["detail"]["state"]}, {d["state"]})
+        # 再读 / 再取消均为幂等，不再产生终态与审计
+        with self.assertRaises(Exception):
+            rep.serve_term(token)
+        rep.cancel_drill("DR-RACE")
+        self.assertEqual(len(self._finished_audits(rep.store, "DR-RACE")), 1)
+
+    def test_52_expired_while_offline_finalized_on_restart(self):
+        """截止时刻在停机期间到达：重启构造时立即收口（不依赖 sweeper），
+        旧凭证即刻 410，同步恢复。"""
+        seed_business(self.base)
+        rep = self.make_replicator()
+        wait_until(lambda: rep.confirmed_index >= 1)
+        locked = rep.confirmed_index
+        drill = rep.create_drill("DR-RESTART", term_seconds=300)
+        token = drill["term_token"]
+        bump_capacity_n(self.base, SEGMENT_SIZE, "offline")
+        self.stop(rep)
+
+        import sqlite3
+        conn = sqlite3.connect(self.replica_db)
+        conn.execute(
+            "UPDATE drills SET term_expires_at = ? WHERE drill_id = 'DR-RESTART'",
+            (time.time() - 10,),
+        )
+        conn.commit()
+        conn.close()
+
+        store2 = ReplicaStore(self.replica_db, segment_size=SEGMENT_SIZE)
+        rep2 = Replicator(store2, primary_url=self.base, poll_interval=0.03)
+        self.addCleanup(self.stop, rep2)
+        # 尚未 start()（sweeper/poller 都没跑）：构造阶段就应已收口
+        self.assertEqual(rep2.get_drill("DR-RESTART")["state"], "EXPIRED")
+        with self.assertRaises(Exception) as cm:
+            rep2.serve_term(token)
+        self.assertEqual(cm.exception.status, 410)
+        self.assertIsNone(rep2.store.active_drill())
+        self.assertEqual(len(self._finished_audits(store2, "DR-RESTART")), 1)
+
+        rep2.start()
+        wait_until(lambda: rep2.confirmed_index >= locked + 1, timeout=6)
+        self.assertEqual(rep2.confirmed_index, locked + 1)
+
+    def test_53_two_processes_finalize_only_once(self):
+        """两个复制器进程共用同一 DB 同时收口同一到期演练：
+        SQLite 条件更新保证只有一个赢家，终态/审计各一条。"""
+        seed_business(self.base)
+        rep = self.make_replicator()
+        self.addCleanup(self.stop, rep)
+        wait_until(lambda: rep.confirmed_index >= 1)
+        rep.create_drill("DR-2PROC", term_seconds=300)
+
+        store2 = ReplicaStore(self.replica_db, segment_size=SEGMENT_SIZE)
+        rep2 = Replicator(store2, primary_url=self.base, poll_interval=0.03)
+        self.addCleanup(self.stop, rep2)
+        rep2.start()
+
+        import sqlite3
+        conn = sqlite3.connect(self.replica_db)
+        conn.execute(
+            "UPDATE drills SET term_expires_at = ? WHERE drill_id = 'DR-2PROC'",
+            (time.time() - 1,),
+        )
+        conn.commit()
+        conn.close()
+
+        # 两边都立即扫一遍（竞争同一行）
+        rep.sweep_due_terms()
+        rep2.sweep_due_terms()
+        time.sleep(0.3)
+
+        d1 = rep.get_drill("DR-2PROC")
+        d2 = rep2.get_drill("DR-2PROC")
+        self.assertEqual(d1["state"], "EXPIRED")
+        self.assertEqual(d2["state"], "EXPIRED")
+        finals = self._finished_audits(rep.store, "DR-2PROC")
+        self.assertEqual(len(finals), 1)
+
+    def test_54_recovery_repairs_state_without_audit(self):
+        """终态已落但收口审计缺失（两步提交间崩溃）：重启补一条审计，
+        不改动终态。"""
+        seed_business(self.base)
+        rep = self.make_replicator()
+        wait_until(lambda: rep.confirmed_index >= 1)
+        rep.create_drill("DR-HALF1", term_seconds=300)
+        self.stop(rep)
+
+        import sqlite3
+        conn = sqlite3.connect(self.replica_db)
+        conn.execute(
+            "UPDATE drills SET state='EXPIRED', term_token=NULL, term_expires_at=NULL,"
+            " finished_at=?, fail_reason='TERM_EXPIRED', updated_at=?"
+            " WHERE drill_id='DR-HALF1'",
+            (time.time() - 5, time.time() - 5),
+        )
+        conn.commit()
+        conn.close()
+
+        store2 = ReplicaStore(self.replica_db, segment_size=SEGMENT_SIZE)
+        rep2 = Replicator(store2, primary_url=self.base, poll_interval=0.03)
+        self.addCleanup(self.stop, rep2)
+        self.assertEqual(rep2.get_drill("DR-HALF1")["state"], "EXPIRED")
+        finals = self._finished_audits(store2, "DR-HALF1")
+        self.assertEqual(len(finals), 1)
+        self.assertEqual(finals[0]["detail"]["state"], "EXPIRED")
+
+    def test_55_recovery_repairs_audit_without_state(self):
+        """收口审计已在但行残留 ISSUED（镜像半截）：重启把行补到既有终态，
+        不重复写审计。"""
+        seed_business(self.base)
+        rep = self.make_replicator()
+        wait_until(lambda: rep.confirmed_index >= 1)
+        rep.create_drill("DR-HALF2", term_seconds=300)
+        self.stop(rep)
+
+        import sqlite3
+        conn = sqlite3.connect(self.replica_db)
+        conn.execute(
+            "INSERT INTO audit_log (at, kind, detail_json) VALUES (?,?,?)",
+            (time.time() - 5, "drill_finished",
+             json.dumps({"drill_id": "DR-HALF2", "state": "EXPIRED",
+                         "reason": "TERM_EXPIRED", "detail": "x"}, sort_keys=True)),
+        )
+        conn.execute(
+            "UPDATE drills SET term_expires_at = ? WHERE drill_id = 'DR-HALF2'",
+            (time.time() - 5,),
+        )
+        conn.commit()
+        conn.close()
+
+        store2 = ReplicaStore(self.replica_db, segment_size=SEGMENT_SIZE)
+        rep2 = Replicator(store2, primary_url=self.base, poll_interval=0.03)
+        self.addCleanup(self.stop, rep2)
+        self.assertEqual(rep2.get_drill("DR-HALF2")["state"], "EXPIRED")
+        finals = self._finished_audits(store2, "DR-HALF2")
+        self.assertEqual(len(finals), 1)
+
+    def test_56_recovery_does_not_skip_pending_quarantine(self):
+        """异常批次（gap）尚未处置时演练到期：收口后续传必须先补上缺口
+        分段、消除旧隔离，再继续前进，绝不跳过异常分段。"""
+        seed_business(self.base, rounds=SEGMENT_SIZE * 2)
+        rep = self.make_replicator()
+        self.addCleanup(self.stop, rep)
+        wait_until(lambda: rep.confirmed_index >= 1)
+        rep.set_paused(True)
+        wait_until(lambda: rep.status()["replication"]["primary_sealed_index"] >= 2)
+        self.set_chaos("gap", 2)
+        rep.set_paused(False)
+        wait_until(lambda: any(
+            q["reason"] == verifier.SEGMENT_INDEX_MISMATCH
+            for q in rep.store.list_quarantined()))
+        self.assertEqual(rep.confirmed_index, 1)
+
+        drill = rep.create_drill("DR-GAP", term_seconds=1)
+        self.assertEqual(drill["locked_index"], 1)
+        wait_until(lambda: rep.get_drill("DR-GAP")["state"] == "EXPIRED", timeout=4)
+        # 缺口未恢复前，边界仍停在 1：恢复过程不得跳过段 2
+        time.sleep(0.4)
+        self.assertEqual(rep.confirmed_index, 1)
+
+        self.set_chaos(None)
+        wait_until(lambda: rep.confirmed_index >= 2, timeout=8)
+        self.assertEqual(rep.confirmed_index, 2)
+        resolved = [
+            q for q in rep.store.list_quarantined(True)
+            if q["reason"] == verifier.SEGMENT_INDEX_MISMATCH and q["resolved_at"]
+        ]
+        self.assertTrue(resolved, "缺口恢复后旧隔离必须被消除")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

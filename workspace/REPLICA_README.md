@@ -44,7 +44,7 @@ open http://localhost:8899/
 bash demo_replica.sh
 ```
 
-测试：主站 220 项 + 灾备 18 项端到端（真实 HTTP 双进程 + 真实持久化）：
+测试：主站 220 项 + 灾备 25 项端到端（真实 HTTP 双进程 + 真实持久化）：
 
 ```bash
 python3 test_service.py
@@ -119,8 +119,22 @@ ISSUED（发放不透明任期 token）
    /term/{token}/summary  截面摘要/任期倒计时/冻结摘要
    │
    ├── POST /ops/drills/{id}/cancel ──▶ CANCELLED（地址立即 410，恢复复制）
-   └── 到达 term_expires_at（sweeper 0.5s 检查）──▶ EXPIRED（410）
+   └── 到达 term_expires_at（sweeper 0.5s 检查；无需任何请求触发）──▶ EXPIRED（410）
 ```
+
+- **主动收口**：截止时刻到达后，即使调用方再也不发起请求，后台 sweeper
+  也会**自行结束**该条演练记录（不依赖“下一次读任期地址”惰性触发），
+  旧凭证随后**稳定返回 410**，后台复制立即从冻结点**继续**（不跳号、
+  不漏掉仍待处置的异常批次——缺口分段仍须先补齐并消除旧隔离再前进）；
+- **单次终态 / 单条审计**：终态落盘是一条带状态条件的 SQLite 原子更新
+  （`state IN ('VALIDATING','ISSUED')`），终态行、终态报告与
+  `drill_finished` 审计在**同一事务**提交。定时到期、人工撤销、并发任期
+  读取乃至**两个副本进程共用同一 DB** 同时收口时，只有一个事务能成为赢家，
+  因而全局只落**一次终态、一条审计**；输家按既有终态幂等返回；
+- **重启恢复**：构造时先修复“终态行/收口审计”因崩溃留下的半截不一致
+  （缺审计则补、行残留则按既有审计补齐，均不覆盖既有终态），随后立即
+  作废 VALIDATING 演练、并主动结束在**停机期间到期**的 ISSUED 任期——
+  不等待 sweeper 的首个 tick，重启后不存在“已过期却仍冻结”的窗口；
 
 - **幂等**：同一 `drill_id` 再次请求返回**原结果**（同一 token、同一报告），
   不重复发任期；
@@ -204,4 +218,4 @@ python3 -m replica audit-tail --db ./dr/replica.db --kind segment_quarantined
 | `replica/http_server.py` | 只读查询面、任期地址、运维/演练接口、测试注入口 |
 | `replica/__main__.py` | `serve` / `audit` / `audit-tail` 命令行 |
 | `replica/static/index.html` | 运维页面（进度/延迟/隔离/截面/演练/审计） |
-| `test_replica.py` | 18 项端到端测试 |
+| `test_replica.py` | 25 项端到端测试（含到期主动收口、并发收口、重启恢复与异常批次不跳过） |

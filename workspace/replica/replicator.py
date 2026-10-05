@@ -94,8 +94,12 @@ class Replicator:
         # 滞后隔离做状态化记录，避免同一轮落后反复刷审计
         self._lag_quarantined = False
 
-        # 启动时：验证中的演练因进程重启无法完成 → 作废；已发任期保留
-        self._abort_orphan_validating()
+        # 启动恢复：
+        # - 验证中的演练因进程重启无法保证冻结语义 → 作废；
+        # - 已发任期若截止时刻在停机期间到达 → 立即收口（不等 sweeper 首个
+        #   tick，避免重启后仍有一段“已过期却冻结”的窗口）；
+        # - 修复终态行/收口审计因崩溃留下的半截不一致。
+        self._recover_drills_on_startup()
 
         self._stop = threading.Event()
         self.thread = threading.Thread(target=self._poll_loop, name="replica-poller", daemon=True)
@@ -119,13 +123,29 @@ class Replicator:
     def shutdown(self) -> None:
         self._stop.set()
 
-    def _abort_orphan_validating(self) -> None:
-        drill = self.store.active_drill()
-        if drill and drill["state"] == "VALIDATING":
-            self._finish_drill(
-                drill, "ABORTED", PROCESS_RESTART,
-                "进程重启：验证中的演练无法保证冻结语义，已作废",
-            )
+    def _recover_drills_on_startup(self) -> None:
+        """进程启动时统一收口遗留演练（不依赖后台线程的首个 tick）。"""
+        now = time.time()
+        # 先修复终态行/收口审计因崩溃留下的半截不一致（幂等，只补不改终态），
+        # 再决定哪些活动演练需要收口：避免把“审计已在、行残留 ISSUED”的
+        # 镜像半截误当成新到期，落下第二条终态与审计。
+        for drill in self.store.list_drills(limit=500):
+            self.store.reconcile_drill_termination(drill["drill_id"])
+        for drill in self.store.list_active_drills():
+            if drill["state"] == "VALIDATING":
+                # 验证中的演练无法在新进程内保证“验证窗口内截面定格”，作废
+                self._finalize(
+                    drill, "ABORTED", PROCESS_RESTART,
+                    "进程重启：验证中的演练无法保证冻结语义，已作废",
+                )
+            elif (
+                drill["state"] == "ISSUED"
+                and drill["term_expires_at"]
+                and now >= drill["term_expires_at"]
+            ):
+                # 截止时刻在停机期间已经到达：主动结束，旧凭证即刻稳定 410，
+                # 复制立即从停下的位置继续（poller 不再被一条死演练冻结）
+                self._expire_if_due(drill, now=now)
 
     # ------------------------------------------------------------------
     # 拉取循环
@@ -146,14 +166,60 @@ class Replicator:
 
     def _sweep_loop(self) -> None:
         while not self._stop.wait(0.5):
-            with self._lock:
-                drill = self.store.active_drill()
-                if drill and drill["state"] == "ISSUED":
-                    if drill["term_expires_at"] and time.time() >= drill["term_expires_at"]:
-                        self._finish_drill(
-                            drill, "EXPIRED", TERM_EXPIRED,
-                            f"任期已于 {drill['term_expires_at']} 到期",
-                        )
+            try:
+                self.sweep_due_terms()
+            except Exception as exc:  # sweeper 线程任何异常都不能死
+                with self._lock:
+                    self.last_error = f"{type(exc).__name__}: {exc}"
+
+    def sweep_due_terms(self, now: float | None = None) -> list[str]:
+        """主动收口所有截止时刻已到的 ISSUED 演练。
+
+        即使调用方再也不请求任期地址，演练记录也会在这里自行收口、旧凭证
+        转为稳定 410、后台复制从冻结点继续。返回本次实际收口的演练 id。
+        """
+        now = now if now is not None else time.time()
+        expired: list[str] = []
+        with self._lock:
+            for drill in self.store.list_active_drills():
+                if (
+                    drill["state"] == "ISSUED"
+                    and drill["term_expires_at"]
+                    and now >= drill["term_expires_at"]
+                ):
+                    if self._expire_if_due(drill, now=now):
+                        expired.append(drill["drill_id"])
+        return expired
+
+    def _expire_if_due(self, drill: dict[str, Any], *, now: float) -> bool:
+        """在锁内把一条已到期的 ISSUED 演练收口为 EXPIRED。
+
+        收口前重新从权威行读取，确保定时结束与人工撤销/并发读取相撞时
+        只能落下一次终态：原子条件更新输掉的一方不改状态、不写审计。
+        """
+        fresh = self.store.get_drill(drill["drill_id"])
+        if fresh is None or fresh["state"] != "ISSUED":
+            return False
+        if not fresh["term_expires_at"] or now < fresh["term_expires_at"]:
+            return False
+        return self._finalize(
+            fresh, "EXPIRED", TERM_EXPIRED,
+            f"任期已于 {fresh['term_expires_at']} 到期",
+        )
+
+    def _finalize(self, drill: dict[str, Any], state: str,
+                  reason: str, detail: str) -> bool:
+        """唯一的演练终态落盘路径：原子条件更新 + 同一事务写一条审计。
+
+        返回是否由本次调用完成收口。竞争失败（已被定时到期/人工撤销/另一
+        进程收口）时返回 False，调用方按既有终态幂等返回。
+        """
+        report = drill.get("report") or {}
+        report.setdefault("termination", {"reason": reason, "detail": detail,
+                                          "at": time.time()})
+        return self.store.finalize_drill_if_active(
+            drill["drill_id"], state, reason, detail, report=report,
+        )
 
     def poll_once(self) -> dict[str, Any] | None:
         """一轮拉取：看主站状态 → 滞后判定 → 拉下一分段。返回应用结果。"""
@@ -295,7 +361,9 @@ class Replicator:
                 source=source, segment_index=index, envelope_digest_value=digest,
             )
             if drill["state"] == "VALIDATING":
-                self._finish_drill(
+                # 原子条件收口：若此刻 sweeper/取消/另一进程已抢先终态化，
+                # 这里不会再落第二次终态与审计。
+                self._finalize(
                     drill, "ABORTED", ADVANCE_DURING_DRILL,
                     f"验证尚未完成时分段 {index} 到达，锁定截面不再是受控截面",
                 )
@@ -605,7 +673,7 @@ class Replicator:
 
         except verifier.VerifyError as ve:
             drill["report"] = self._build_report(drill, checks, ok=False, fail_reason=ve.reason)
-            self._finish_drill(drill, "ABORTED", ve.reason, ve.detail)
+            self._finalize(drill, "ABORTED", ve.reason, ve.detail)
             raise ReplicatorError(
                 ve.reason, f"演练 {drill['drill_id']} 验证失败：{ve.detail}",
                 status=409, details={"report": drill["report"]},
@@ -614,23 +682,18 @@ class Replicator:
             raise
         except Exception as exc:
             drill["report"] = self._build_report(drill, checks, ok=False, fail_reason=PRIMARY_UNAVAILABLE)
-            self._finish_drill(drill, "ABORTED", PRIMARY_UNAVAILABLE, str(exc))
+            self._finalize(drill, "ABORTED", PRIMARY_UNAVAILABLE, str(exc))
             raise ReplicatorError(PRIMARY_UNAVAILABLE, str(exc), status=503)
 
         # --- 全部通过：发放带任期的只读查询地址 ---
         now = time.time()
         token = new_token()
-        drill.update({
-            "state": "ISSUED",
-            "term_token": token,
-            "term_expires_at": now + term_seconds,
-            "updated_at": now,
-        })
+        term_expires_at = now + term_seconds
         frozen_state = rebuilt.to_state()
         frozen_state["server_time"] = None
-        drill["report"] = self._build_report(drill, checks, ok=True, extra={
+        report = self._build_report(drill, checks, ok=True, extra={
             "term_token": token,
-            "term_expires_at": drill["term_expires_at"],
+            "term_expires_at": term_expires_at,
             "frozen_digest": replay_digest,
             "surface": {
                 "global_capacity": audit["global_capacity"],
@@ -644,12 +707,29 @@ class Replicator:
                 "commands": self._commands_upto(drill['locked_index']),
             },
         })
-        self.store.upsert_drill(drill)
+        # 受保护推进：只有行仍 VALIDATING 才能 ISSUED。若此刻已被别的路径
+        # 终态化（并发收口/另一进程启动作废），放弃发放并返回权威终态。
+        if not self.store.issue_drill_if_validating(
+            drill["drill_id"], token, term_expires_at, report, now=now
+        ):
+            final = self.store.get_drill(drill["drill_id"])
+            raise ReplicatorError(
+                final["fail_reason"] or VALIDATION_FAILED,
+                f"演练 {drill['drill_id']} 在验证完成前已被收口（{final['state']}）",
+                status=409, details={"report": final.get("report")},
+            )
+        drill.update({
+            "state": "ISSUED",
+            "term_token": token,
+            "term_expires_at": term_expires_at,
+            "updated_at": now,
+            "report": report,
+        })
         self.store.audit("drill_issued", {
             "drill_id": drill["drill_id"],
             "locked_index": drill["locked_index"],
             "term_token": token,
-            "term_expires_at": drill["term_expires_at"],
+            "term_expires_at": term_expires_at,
         })
         return drill
 
@@ -687,28 +767,12 @@ class Replicator:
             if drill["state"] in ("CANCELLED", "ABORTED", "EXPIRED"):
                 drill["idempotent_replay"] = True
                 return drill
-            self._finish_drill(drill, "CANCELLED", "CANCELLED", "操作员取消演练")
-            return drill
-
-    def _finish_drill(
-        self, drill: dict[str, Any], state: str, reason: str, detail: str
-    ) -> None:
-        now = time.time()
-        drill.update({
-            "state": state,
-            "term_token": None,
-            "term_expires_at": None,
-            "updated_at": now,
-            "finished_at": now,
-            "fail_reason": reason,
-        })
-        report = drill.get("report") or {}
-        report.setdefault("termination", {"reason": reason, "detail": detail, "at": now})
-        drill["report"] = report
-        self.store.upsert_drill(drill)
-        self.store.audit("drill_finished", {
-            "drill_id": drill["drill_id"], "state": state, "reason": reason, "detail": detail,
-        })
+            self._finalize(drill, "CANCELLED", "CANCELLED", "操作员取消演练")
+            # 若恰与定时到期相撞并由对方胜出，这里返回权威终态，
+            # 绝不把 EXPIRED 覆盖成 CANCELLED 或再写一条审计。
+            final = self.store.get_drill(drill_id)
+            final["idempotent_replay"] = final["state"] != "CANCELLED"
+            return final
 
     def get_drill(self, drill_id: str) -> dict[str, Any]:
         d = self.store.get_drill(drill_id)
@@ -720,15 +784,20 @@ class Replicator:
         return self.store.list_drills()
 
     def serve_term(self, token: str) -> dict[str, Any]:
-        """带任期的只读查询：仅 ISSUED 且未到期的地址可用。"""
+        """带任期的只读查询：仅 ISSUED 且未到期的地址可用。
+
+        读取路径本身不落终态（保证“并发读取相撞”不会制造额外终态/审计）；
+        若读到一条已过截止时刻却尚未被 sweeper 收口的任期，则触发一次
+        原子条件收口，收口者同样只有一个。
+        """
         with self._lock:
             drill = self.store.drill_by_token(token)
             if drill is None or drill["state"] != "ISSUED":
                 raise ReplicatorError(TERM_EXPIRED, "任期地址无效（演练不存在/已取消/已到期）",
                                       status=410)
-            if drill["term_expires_at"] and time.time() >= drill["term_expires_at"]:
-                self._finish_drill(drill, "EXPIRED", TERM_EXPIRED,
-                                   f"任期已于 {drill['term_expires_at']} 到期")
+            now = time.time()
+            if drill["term_expires_at"] and now >= drill["term_expires_at"]:
+                self._expire_if_due(drill, now=now)
                 raise ReplicatorError(TERM_EXPIRED, "任期地址已到期", status=410)
             surface = dict(drill["report"].get("surface", {}))
             # 兼容旧版本持久化报告：冻结投影旧键名为 state

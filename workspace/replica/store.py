@@ -317,6 +317,141 @@ class ReplicaStore:
         del d["report_json"]
         return d
 
+    def list_active_drills(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM drills WHERE state IN ('VALIDATING','ISSUED')"
+            " ORDER BY created_at"
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["report"] = json.loads(d["report_json"]) if d["report_json"] else {}
+            del d["report_json"]
+            out.append(d)
+        return out
+
+    def finalize_drill_if_active(
+        self,
+        drill_id: str,
+        state: str,
+        reason: str,
+        detail: str,
+        report: dict[str, Any] | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """把演练从**非终态**原子收口为终态，并在同一事务写且只写一条审计。
+
+        条件更新（``state IN ('VALIDATING','ISSUED')``）是跨线程/跨进程的
+        唯一赢家选举：定时到期与人工撤销（乃至第二个副本进程）同时收口时，
+        只有一个事务能把行改写成功，且终态报告、状态变更与
+        ``drill_finished`` 审计在同一事务提交——要么三者都落，要么都不落，
+        绝不会出现“终态已落但审计缺失”或“审计已写但状态还停在 ISSUED”的
+        半截状态。
+
+        返回 True 表示本次调用是唯一赢家；False 表示演练已被别的路径收口，
+        调用方必须保持原终态、不得再写审计。
+        """
+        now = now if now is not None else time.time()
+        with self.lock, self.conn:
+            if report is not None:
+                cur = self.conn.execute(
+                    "UPDATE drills SET state = ?, term_token = NULL, term_expires_at = NULL,"
+                    " updated_at = ?, finished_at = ?, fail_reason = ?, report_json = ?"
+                    " WHERE drill_id = ? AND state IN ('VALIDATING','ISSUED')",
+                    (state, now, now, reason, canonical(report), drill_id),
+                )
+            else:
+                # 不带报告：保留既有 report_json，仅在其中并入 termination 注记，
+                # 避免把内存中没有完整报告的收口路径写成空报告。
+                cur = self.conn.execute(
+                    "UPDATE drills SET state = ?, term_token = NULL, term_expires_at = NULL,"
+                    " updated_at = ?, finished_at = ?, fail_reason = ?,"
+                    " report_json = json_set(COALESCE(report_json, '{}'),"
+                    "                          '$.termination', json(?))"
+                    " WHERE drill_id = ? AND state IN ('VALIDATING','ISSUED')",
+                    (state, now, now, reason,
+                     canonical({"reason": reason, "detail": detail, "at": now}), drill_id),
+                )
+            won = cur.rowcount == 1
+            if not won:
+                return False
+            self.conn.execute(
+                "INSERT INTO audit_log (at, kind, detail_json) VALUES (?,?,?)",
+                (now, "drill_finished",
+                 canonical({"drill_id": drill_id, "state": state,
+                            "reason": reason, "detail": detail})),
+            )
+            return True
+
+    def issue_drill_if_validating(
+        self, drill_id: str, token: str, term_expires_at: float,
+        report: dict[str, Any], now: float | None = None,
+    ) -> bool:
+        """VALIDATING → ISSUED 的受保护推进。
+
+        只允许行仍处于 VALIDATING 时发放任期；若演练已被并发收口（另一进程
+        的启动作废 / ADVANCE_DURING_DRILL），条件更新影响 0 行，调用方必须
+        放弃发放，绝不把终态覆盖回 ISSUED。
+        """
+        now = now if now is not None else time.time()
+        with self.lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE drills SET state = 'ISSUED', term_token = ?,"
+                " term_expires_at = ?, report_json = ?, updated_at = ?"
+                " WHERE drill_id = ? AND state = 'VALIDATING'",
+                (token, term_expires_at, canonical(report), now, drill_id),
+            )
+            return cur.rowcount == 1
+
+    def reconcile_drill_termination(self, drill_id: str) -> dict[str, Any] | None:
+        """恢复时修复“终态行 / 收口审计”因崩溃留下的不一致（幂等）。
+
+        - 行已终态但缺 ``drill_finished`` 审计：补一条，原因取行上的
+          ``fail_reason``，不覆盖任何既有终态；
+        - 审计已在但行仍停在非终态（审计先落盘、状态回滚的镜像半截）：
+          不重复写审计，只把行补到该审计记录的终态。
+
+        修复后返回演练行；两者一致或演练不存在时返回 None。
+        """
+        with self.lock, self.conn:
+            r = self.conn.execute(
+                "SELECT * FROM drills WHERE drill_id = ?", (drill_id,)
+            ).fetchone()
+            if r is None:
+                return None
+            row = dict(r)
+            fin_rows = self.conn.execute(
+                "SELECT detail_json FROM audit_log"
+                " WHERE kind = 'drill_finished'"
+                " AND json_extract(detail_json, '$.drill_id') = ?"
+                " ORDER BY id",
+                (drill_id,),
+            ).fetchall()
+            finals = [json.loads(x["detail_json"]) for x in fin_rows]
+            terminal = row["state"] in ("CANCELLED", "ABORTED", "EXPIRED")
+
+            if terminal and not finals:
+                # 终态已落、审计缺失：补审计，绝不改动终态。
+                reason = row["fail_reason"] or row["state"]
+                self.conn.execute(
+                    "INSERT INTO audit_log (at, kind, detail_json) VALUES (?,?,?)",
+                    (row["finished_at"] or time.time(), "drill_finished",
+                     canonical({"drill_id": drill_id, "state": row["state"],
+                                "reason": reason,
+                                "detail": "崩溃恢复：补记缺失的收口审计"})),
+                )
+            elif not terminal and finals:
+                # 审计已在、行残留非终态：把行补齐到既有审计终态，不再写审计。
+                final_state = finals[-1]["state"]
+                reason = finals[-1].get("reason") or final_state
+                self.conn.execute(
+                    "UPDATE drills SET state = ?, term_token = NULL, term_expires_at = NULL,"
+                    " finished_at = COALESCE(finished_at, ?), fail_reason = ?,"
+                    " updated_at = ? WHERE drill_id = ?",
+                    (final_state, time.time(), reason, time.time(), drill_id),
+                )
+        return self.get_drill(drill_id)
+
     def drill_by_token(self, token: str) -> dict[str, Any] | None:
         r = self.conn.execute(
             "SELECT * FROM drills WHERE term_token = ?", (token,)
